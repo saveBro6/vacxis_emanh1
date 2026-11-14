@@ -19,13 +19,13 @@ from typing import Any, Literal
 from .vllm_client import VLLMError
 
 
-StoreName = Literal["rewrites", "masks", "answers"]
+StoreName = Literal["rewrites", "masks", "mask_fills", "answers"]
 
 
 class VLLMCheckpoint:
     """JSON checkpoint with one sub-store per LLM stage."""
 
-    _STORES: tuple[str, ...] = ("rewrites", "masks", "answers")
+    _STORES: tuple[str, ...] = ("rewrites", "masks", "mask_fills", "answers")
 
     def __init__(
         self,

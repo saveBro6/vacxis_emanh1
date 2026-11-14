@@ -30,7 +30,9 @@ from .vllm_client import VLLMClient, VLLMError
 
 # Bump when the stage prompts change so a stale checkpoint is rejected rather
 # than silently mixing incompatible outputs.
-PROMPT_VERSION = 3
+PROMPT_VERSION = 4
+
+SYMPTOM_MASK_TOKEN = "<symptom_mask>"
 
 # The real query types, pulled from the taxonomy so the model must pick from
 # exactly the values the rest of the pipeline understands.
@@ -76,7 +78,7 @@ def run_batched_stage(
     *,
     client: VLLMClient,
     checkpoint: VLLMCheckpoint | None,
-    store: Literal["rewrites", "masks", "answers"],
+    store: Literal["rewrites", "masks", "mask_fills", "answers"],
     key_of: Callable[[Any], Any | None],
     build_prompt: Callable[[Any], str],
     parse: Callable[[str, Any], Any | None],
@@ -248,31 +250,25 @@ class QwenRewriter:
 
 
 # ---------------------------------------------------------------------------
-# Symptom-masking stage.
+# Symptom-masking stage (part 1: placeholder generation).
 # ---------------------------------------------------------------------------
-_MASK_SYSTEM = """Bạn là người hiệu chỉnh câu hỏi y tế bằng tiếng Việt. Với một
-câu hỏi và các đoạn CHỨNG CỨ đi kèm, tìm các triệu chứng được nêu trong
-câu hỏi mà KHÔNG xuất hiện trong chứng cứ. Thay mỗi triệu chứng đó bằng một
-triệu chứng có mặt trong chứng cứ sao cho câu hỏi vẫn tự nhiên. Chỉ trả JSON,
-không dùng Markdown."""
+_MASK_SYSTEM = f"""Bạn là chuyên gia phân tích câu hỏi y tế bằng tiếng Việt.
+Nhiệm vụ của bạn là đọc CÂU HỎI và thay thế mọi bệnh lý, triệu chứng, thể trạng,
+tình trạng sức khỏe của bệnh nhân bằng token {SYMPTOM_MASK_TOKEN}.
+Giữ nguyên tên vắc xin, cấu trúc câu và phần còn lại của câu hỏi để câu vẫn tự nhiên.
+Nếu câu hỏi không đề cập đến bệnh lý, triệu chứng, thể trạng hoặc tình trạng bệnh nhân,
+giữ nguyên câu hỏi gốc. Chỉ trả JSON, không dùng Markdown."""
 
 _MASK_USER_TMPL = """CÂU HỎI: {query}
 
-CÁC ĐOẠN CHỨNG CỨ (chỉ các chunk có điểm liên quan cao):
-{chunks}
-
-Trả JSON: {{"replacements": [{{"original": "triệu chứng trong câu hỏi",
-"replacement": "triệu chứng trong chứng cứ"}}, ...]}}. Nếu không có gì
-cần thay, trả {{"replacements": []}}."""
+Trả JSON: {{"masked_query": "câu hỏi sau khi thay bằng {mask_token}"}}."""
 
 
 class QwenSymptomMasker:
-    """LLM-backed symptom replacement for masked dataset records.
+    """Part 1 of symptom masking: replace patient conditions with ``<symptom_mask>``.
 
-    Records with no relevant chunk text (the UNANSWERABLE records) are
-    skipped deterministically: there is no evidence to ground a
-    replacement against, and the caller would drop the pair anyway, so an
-    LLM call on a "(không có chứng cứ)" prompt can only hallucinate.
+    Records without any ``RELEVANCE_SCORE == 3`` chunk are skipped
+    deterministically because Part 2 cannot ground a replacement for them.
     """
 
     def __init__(
@@ -286,28 +282,24 @@ class QwenSymptomMasker:
         self.checkpoint = checkpoint
         self.batch_size = max(1, batch_size)
 
-    def mask(self, records: list[dict[str, Any]]) -> list[list[dict[str, str]]]:
-        """Return one list of ``{original, replacement}`` pairs per record."""
+    def mask(self, records: list[dict[str, Any]]) -> list[str]:
+        """Return one masked query string per record."""
         if not records:
             return []
 
-        # Partition: only records with a score-3 chunk text reach the LLM.
-        from .postprocess import relevant_chunk_texts
+        from .postprocess import relevant_chunks
 
-        needs_llm: list[tuple[int, dict[str, Any]]] = []
-        for i, record in enumerate(records):
-            if not relevant_chunk_texts(record):
-                continue
-            needs_llm.append((i, record))
+        needs_llm: list[tuple[int, dict[str, Any]]] = [
+            (i, record)
+            for i, record in enumerate(records)
+            if relevant_chunks(record)
+        ]
 
-        def build_prompt(_: tuple[int, dict[str, Any]]) -> str:
-            _idx, record = _
-            chunks_context = "\n\n---\n\n".join(
-                t for t in relevant_chunk_texts(record) if t
-            )
+        def build_prompt(item: tuple[int, dict[str, Any]]) -> str:
+            _idx, record = item
             user = _MASK_USER_TMPL.format(
                 query=record.get("QUERY", ""),
-                chunks=chunks_context or "(không có chứng cứ)",
+                mask_token=SYMPTOM_MASK_TOKEN,
             )
             return self.client.render(
                 [
@@ -316,29 +308,21 @@ class QwenSymptomMasker:
                 ]
             )
 
-        def parse(raw_text: str, item: tuple[int, dict[str, Any]]) -> list[dict[str, str]]:
-            _idx, record = item
-            data = _extract_json(raw_text) or {}
-            raw_pairs = data.get("replacements")
-            cleaned: list[dict[str, str]] = []
-            if isinstance(raw_pairs, list):
-                for entry in raw_pairs:
-                    if isinstance(entry, dict):
-                        cleaned.append(
-                            {
-                                "original": str(entry.get("original", "")).strip(),
-                                "replacement": str(
-                                    entry.get("replacement", "")
-                                ).strip(),
-                            }
-                        )
-            return cleaned
+        def parse(raw_text: str, _item: tuple[int, dict[str, Any]]) -> str | None:
+            data = _extract_json(raw_text)
+            if not data:
+                return None
+            masked = data.get("masked_query")
+            if not isinstance(masked, str):
+                return None
+            masked = masked.strip()
+            return masked or None
 
-        def default(_item: tuple[int, dict[str, Any]]) -> list[dict[str, str]]:
-            return []
+        def default(item: tuple[int, dict[str, Any]]) -> str:
+            return str(item[1].get("QUERY", "") or "")
 
         values = run_batched_stage(
-            [pair for pair in needs_llm],
+            needs_llm,
             client=self.client,
             checkpoint=self.checkpoint,
             store="masks",
@@ -350,11 +334,121 @@ class QwenSymptomMasker:
             max_tokens=512,
         )
 
-        # No-chunk records are skipped; the LLM was never called, so there is
-        # nothing to cache and nothing to resume — they are not part of
-        # ``needs_llm`` and default to ``[]`` here.
-        results: list[list[dict[str, str]]] = [[] for _ in records]
+        results = [str(r.get("QUERY", "") or "") for r in records]
         for (idx, _record), value in zip(needs_llm, values):
+            results[idx] = value
+        return results
+
+
+# ---------------------------------------------------------------------------
+# Symptom-masking stage (part 2: grounded mask filling).
+# ---------------------------------------------------------------------------
+_FILL_SYSTEM = f"""Bạn là chuyên gia hiệu chỉnh câu hỏi y tế bằng tiếng Việt.
+Bạn nhận một CÂU HỎI CÓ MASK chứa một hoặc nhiều token {SYMPTOM_MASK_TOKEN} cùng các
+đoạn CHỨNG CỨ (kèm CHUNK_ID có điểm liên quan cao nhất).
+Hãy đọc kỹ chứng cứ và điền thông tin bệnh lý, triệu chứng, thể trạng hoặc tình trạng
+phù hợp có trong chứng cứ vào từng vị trí {SYMPTOM_MASK_TOKEN} sao cho câu hỏi hoàn chỉnh,
+tự nhiên và đúng ngữ pháp tiếng Việt. Không để sót {SYMPTOM_MASK_TOKEN}.
+Chỉ trả JSON, không dùng Markdown."""
+
+_FILL_USER_TMPL = """CÂU HỎI CÓ MASK: {masked_query}
+
+CÁC ĐOẠN CHỨNG CỨ (RELEVANCE_SCORE == 3):
+{chunks}
+
+Trả JSON: {{"filled_query": "câu hỏi hoàn chỉnh sau khi điền thông tin vào mask"}}."""
+
+
+class QwenSymptomFiller:
+    """Part 2 of symptom masking: fill ``<symptom_mask>`` using score-3 chunks."""
+
+    def __init__(
+        self,
+        client: VLLMClient,
+        *,
+        checkpoint: VLLMCheckpoint | None = None,
+        batch_size: int = 64,
+    ) -> None:
+        self.client = client
+        self.checkpoint = checkpoint
+        self.batch_size = max(1, batch_size)
+
+    def fill(
+        self,
+        records: list[dict[str, Any]],
+        masked_queries: list[str],
+    ) -> list[str]:
+        """Fill ``<symptom_mask>`` placeholders for each record."""
+        if not records:
+            return []
+        if len(records) != len(masked_queries):
+            raise ValueError(
+                f"records ({len(records)}) and masked_queries ({len(masked_queries)}) "
+                "must have the same length."
+            )
+
+        from .postprocess import relevant_chunks
+
+        needs_llm: list[tuple[int, dict[str, Any], str, list[tuple[str, str]]]] = []
+        for i, (record, masked_query) in enumerate(zip(records, masked_queries)):
+            chunks = relevant_chunks(record)
+            if not chunks or SYMPTOM_MASK_TOKEN not in (masked_query or ""):
+                continue
+            needs_llm.append((i, record, masked_query, chunks))
+
+        def build_prompt(
+            item: tuple[int, dict[str, Any], str, list[tuple[str, str]]],
+        ) -> str:
+            _idx, _record, masked_query, chunks = item
+            chunks_context = "\n\n---\n\n".join(
+                f"[CHUNK_ID: {chunk_id}]\n{text}" for chunk_id, text in chunks
+            )
+            user = _FILL_USER_TMPL.format(
+                masked_query=masked_query,
+                chunks=chunks_context,
+            )
+            return self.client.render(
+                [
+                    {"role": "system", "content": _FILL_SYSTEM},
+                    {"role": "user", "content": user},
+                ]
+            )
+
+        def parse(
+            raw_text: str,
+            _item: tuple[int, dict[str, Any], str, list[tuple[str, str]]],
+        ) -> str | None:
+            data = _extract_json(raw_text)
+            if not data:
+                return None
+            filled = data.get("filled_query")
+            if not isinstance(filled, str):
+                return None
+            filled = filled.strip()
+            if not filled or SYMPTOM_MASK_TOKEN in filled:
+                return None
+            return filled
+
+        def default(
+            item: tuple[int, dict[str, Any], str, list[tuple[str, str]]],
+        ) -> str:
+            return str(item[1].get("QUERY", "") or "")
+
+        values = run_batched_stage(
+            needs_llm,
+            client=self.client,
+            checkpoint=self.checkpoint,
+            store="mask_fills",
+            key_of=lambda item: item[1].get("SOURCE_QUERY_ID"),
+            build_prompt=build_prompt,
+            parse=parse,
+            default=default,
+            batch_size=self.batch_size,
+            max_tokens=512,
+        )
+
+        results = [str(r.get("QUERY", "") or "") for r in records]
+        for (idx, _record, _masked, _chunks), value in zip(needs_llm, values):
             results[idx] = value
         return results
 

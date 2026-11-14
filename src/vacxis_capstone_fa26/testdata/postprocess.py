@@ -60,14 +60,22 @@ def split_records(
     return list(records[:split_at]), list(records[split_at:])
 
 
+def relevant_chunks(record: dict[str, Any]) -> list[tuple[str, str]]:
+    """Return ``(CHUNK_ID, TEXT)`` pairs for chunks with ``RELEVANCE_SCORE == 3``."""
+    chunks = record.get("RELEVANT_CHUNKS") or []
+    result: list[tuple[str, str]] = []
+    for c in chunks:
+        if c.get("RELEVANCE_SCORE", 0) >= 3:
+            chunk_id = str(c.get("CHUNK_ID", "") or "")
+            text = str(c.get("TEXT", "") or "")
+            if text:
+                result.append((chunk_id, text))
+    return result
+
+
 def relevant_chunk_texts(record: dict[str, Any]) -> list[str]:
     """Texts of the record's relevant chunks (RELEVANCE_SCORE == 3)."""
-    chunks = record.get("RELEVANT_CHUNKS") or []
-    return [
-        c.get("TEXT", "") or ""
-        for c in chunks
-        if c.get("RELEVANCE_SCORE", 0) >= 3
-    ]
+    return [text for _chunk_id, text in relevant_chunks(record)]
 
 
 def _normalize(term: str) -> str:

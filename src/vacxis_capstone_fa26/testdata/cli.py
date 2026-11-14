@@ -21,11 +21,12 @@ from .answer_generator import ExtractiveAnswerGenerator
 from .checkpoint import VLLMCheckpoint
 from .chunks import index_by_category, index_by_vaccine, load_chunks
 from .generator import derive_default_seed, generate_and_validate
-from .postprocess import apply_replacements, filter_no_han, split_records
+from .postprocess import filter_no_han, split_records
 from .stages import (
     PROMPT_VERSION,
     QwenAnswerStage,
     QwenRewriter,
+    QwenSymptomFiller,
     QwenSymptomMasker,
 )
 from .validator import validate, verify_record
@@ -291,6 +292,11 @@ def main(argv: list[str] | None = None) -> int:
         checkpoint=checkpoint,
         batch_size=args.answers_batch_size,
     )
+    filler = QwenSymptomFiller(
+        client,
+        checkpoint=checkpoint,
+        batch_size=args.answers_batch_size,
+    )
     answer_stage = (
         ExtractiveAnswerGenerator()
         if args.dry_run_answers
@@ -350,15 +356,19 @@ def main(argv: list[str] | None = None) -> int:
         # 6. split head/tail.
         head, tail = split_records(queries, args.split_at)
 
-        # 7. mask the tail (LLM, or skipped on the dry-run path) and apply
-        # validated replacements.
-        print("Masking symptoms of the tail")
-        pairs = masker.mask(tail)
+        # 7. mask the tail in two stages: (1) replace patient conditions with
+        # <symptom_mask>, (2) fill masks grounded on RELEVANCE_SCORE == 3 chunks.
+        print("Masking symptoms of the tail (step 1/2: <symptom_mask>)")
+        masked_queries = masker.mask(tail)
+        print("Filling symptom masks from score-3 chunks (step 2/2)")
+        filled_queries = filler.fill(tail, masked_queries)
         masked_tail: list[dict] = []
-        applied_total = 0
-        for record, record_pairs in zip(tail, pairs):
-            updated, report = apply_replacements(record, record_pairs)
-            applied_total += len(report["applied"])
+        masked_count = 0
+        for record, filled_query in zip(tail, filled_queries):
+            updated = dict(record)
+            if filled_query and filled_query != record.get("QUERY", ""):
+                updated["QUERY"] = filled_query
+                masked_count += 1
             masked_tail.append(updated)
 
         # 8. one unified answer+label pass over both files (LLM for the
@@ -388,7 +398,7 @@ def main(argv: list[str] | None = None) -> int:
         json.dump(masked_tail, f, ensure_ascii=False, indent=2)
     print(
         f"Wrote {len(masked_tail)} symptom-masked records to {out_masked} "
-        f"({applied_total} symptoms replaced)"
+        f"({masked_count} queries masked)"
     )
     return 0
 
